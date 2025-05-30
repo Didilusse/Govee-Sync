@@ -8,10 +8,11 @@
 import SwiftUI
 
 @main
-struct Govee_SyncApp: App {
+struct GoveeBLEApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .frame(minWidth: 600, minHeight: 400)
         }
     }
 }
