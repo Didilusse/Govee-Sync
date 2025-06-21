@@ -29,7 +29,6 @@ extension Color {
             NSColor(self).getRed(&red, green: &green, blue: &blue, alpha: &opacity)
         }()
         #else
-        // Fallback for non-macOS platforms if this code were to be reused
         if let cgColor = self.cgColor {
             if let components = cgColor.components {
                 if cgColor.numberOfComponents >= 3 {
