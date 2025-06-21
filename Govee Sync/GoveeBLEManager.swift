@@ -9,19 +9,16 @@
 import SwiftUI
 import CoreBluetooth
 import Combine
+import ScreenCaptureKit
+
+// MARK: - Constants and Extensions
 
 let GOVEE_CONTROL_CHARACTERISTIC_UUID = CBUUID(string: "00010203-0405-0607-0809-0a0b0c0d2b11")
 let GOVEE_COMMAND_HEAD: UInt8 = 0x33
 let GOVEE_KEEP_ALIVE_HEAD: UInt8 = 0xAA
 
-extension Data {
-    func hexEncodedString() -> String {
-        return map { String(format: "%02hhx", $0) }.joined()
-    }
-}
-
-extension CBManagerState {
-    var description: String {
+extension CBManagerState: CustomStringConvertible {
+    public var description: String {
         switch self {
         case .poweredOff: return "Powered Off"
         case .poweredOn: return "Powered On"
@@ -34,206 +31,271 @@ extension CBManagerState {
     }
 }
 
+// MARK: - GoveeBLEManager
+
 class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
-    private var cbManager: CBCentralManager!
+
+    // MARK: - Published State Properties
     
+    // Connection & Scanning
     @Published var isScanning: Bool = false
     @Published var discoveredPeripherals: [CBPeripheral] = []
     @Published var connectedPeripheral: CBPeripheral? = nil
-    @Published var connectionStatus: String = "App Started. Initialize Bluetooth..."
-    
-    @Published var isDeviceOn: Bool = false
-    @Published var currentBrightness: UInt8 = 50
-    @Published var currentColorRGB: (r: UInt8, g: UInt8, b: UInt8) = (255, 255, 255)
+    @Published var connectionStatus: String = "App Started. Initializing Bluetooth..."
     @Published var isDeviceControlReady: Bool = false
+
+    // Device State
+    @Published var isDeviceOn: Bool = false
+    @Published var currentBrightness: UInt8 = 100
+    @Published var currentColorRGB: (r: UInt8, g: UInt8, b: UInt8) = (255, 255, 255)
     
-    @Published var isScreenMirroringActive: Bool = false
-    
-    private var controlCharacteristic: CBCharacteristic? = nil
-    private var keepAliveTimer: Timer?
-    private let keepAliveInterval: TimeInterval = 5
-    private let screenColorService: ScreenColorService
-    private var bleUpdateTimer: Timer?
-    private let bleMirrorUpdateInterval: TimeInterval =  1.0 / 10.0
-    private var currentScreenAvgColor: (r: UInt8, g: UInt8, b: UInt8)? = nil
-    private var lastSentScreenMirrorColorRGB: (r: UInt8, g: UInt8, b: UInt8)? = nil
-    private var lastSentScreenMirrorBrightness: UInt8? = nil
-    
-    override init() {
-        self.screenColorService = ScreenColorService()
-        super.init()
-        cbManager = CBCentralManager(delegate: self, queue: nil)
-        self.screenColorService.onNewAverageColor = { [weak self] avgColorTuple in
+    // Feature State
+    @Published var activeLightMode: LightMode = .manual {
+        didSet {
             DispatchQueue.main.async {
-                self?.currentScreenAvgColor = avgColorTuple
+                self.handleModeChange(from: oldValue, to: self.activeLightMode)
+            }
+        }
+    }
+    @Published var availableDisplays: [SCDisplay] = []
+    @Published var selectedDisplayID: CGDirectDisplayID?
+    
+    // MARK: - Private Properties
+    
+    private var cbManager: CBCentralManager!
+    private var controlCharacteristic: CBCharacteristic?
+    
+    // Services & Timers
+    private let screenColorService: ScreenColorService
+        private var keepAliveTimer: Timer?
+        private var activeEffectTimer: Timer?
+    
+    // Effect-specific state
+    private var currentHue: CGFloat = 0.0 // For rainbow effect
+    
+    // Caching to reduce redundant BLE commands
+    private var lastSentColorRGB: (r: UInt8, g: UInt8, b: UInt8)?
+    private var lastSentBrightness: UInt8?
+    
+    private var lastBrightnessUpdateTime: Date = .distantPast
+    private let brightnessUpdateThrottle: TimeInterval = 0.1 // Send updates at most every 100ms (10hz)
+
+
+
+    // MARK: - Light Mode Management
+    
+    enum LightMode: CaseIterable, Identifiable {
+        case manual
+        case screenMirroring
+        case rainbow
+        
+        var id: Self { self }
+        
+        var description: String {
+            switch self {
+            case .manual: return "Manual"
+            case .screenMirroring: return "Screen Sync"
+            case .rainbow: return "Rainbow"
             }
         }
     }
     
-    private func calculateChecksum(frame: [UInt8]) -> UInt8 {
-        var checksum: UInt8 = 0
-        for byteVal in frame { checksum ^= byteVal }
-        return checksum
-    }
-    
-    private func sendGoveePacket(head: UInt8, cmd: UInt8, payload: [UInt8]) {
-        guard let peripheral = connectedPeripheral, let char = controlCharacteristic else { return }
-        guard payload.count <= 17 else { return }
-        
-        var frame: [UInt8] = [head, cmd]
-        frame.append(contentsOf: payload)
-        let paddingLength = 19 - frame.count
-        if paddingLength > 0 { frame.append(contentsOf: [UInt8](repeating: 0, count: paddingLength)) }
-        
-        let checksum = calculateChecksum(frame: frame)
-        var packet = frame
-        packet.append(checksum)
-        let data = Data(packet)
-        peripheral.writeValue(data, for: char, type: .withoutResponse)
-    }
-    
-    @objc private func sendKeepAliveCommand() {
-        sendGoveePacket(head: GOVEE_KEEP_ALIVE_HEAD, cmd: 0x01, payload: [])
-    }
-    
-    private func startKeepAliveTimer() {
-        stopKeepAliveTimer()
-        guard connectedPeripheral != nil, controlCharacteristic != nil else { return }
-        DispatchQueue.main.async {
-            self.sendKeepAliveCommand()
-            self.keepAliveTimer = Timer.scheduledTimer(timeInterval: self.keepAliveInterval, target: self, selector: #selector(self.sendKeepAliveCommand), userInfo: nil, repeats: true)
+    init(settings: AppSettings) {
+            // The screen color service is now initialized with the settings.
+            self.screenColorService = ScreenColorService(settings: settings)
+            super.init()
+            cbManager = CBCentralManager(delegate: self, queue: nil)
+            
+            self.screenColorService.onNewAverageColor = { [weak self] avgColorTuple in
+                guard let self = self, self.activeLightMode == .screenMirroring, let color = avgColorTuple else { return }
+                self.sendScreenColorToDevice(newScreenColorRGB: color)
+            }
+            
+            Task {
+                await self.updateAvailableDisplays()
+            }
         }
-    }
     
-    private func stopKeepAliveTimer() {
-        DispatchQueue.main.async {
-            self.keepAliveTimer?.invalidate()
-            self.keepAliveTimer = nil
+    private func handleModeChange(from oldMode: LightMode, to newMode: LightMode) {
+            if oldMode == newMode { return }
+            
+            print("[ModeChange] Switching from \(oldMode) to \(newMode)")
+            stopAllModes()
+
+            if newMode != .manual && !isDeviceOn {
+                setPower(isOn: true, internalOnly: true)
+            }
+            
+            switch newMode {
+            case .screenMirroring:
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    guard self.activeLightMode == .screenMirroring else { return }
+                    self.startScreenMirroringInternal()
+                }
+            case .rainbow:
+                startRainbowEffectInternal()
+            case .manual:
+                setColor(r: currentColorRGB.r, g: currentColorRGB.g, b: currentColorRGB.b)
+                // Use setFinalBrightness to ensure the value is sent
+                setFinalBrightness(level: currentBrightness)
+                break
+            }
         }
-    }
+    
+    /// Stops all timers and services associated with dynamic modes.
+    private func stopAllModes() {
+            screenColorService.stopMonitoring()
+            activeEffectTimer?.invalidate()
+            activeEffectTimer = nil
+            lastSentColorRGB = nil
+            lastSentBrightness = nil
+        }
+
+    // MARK: - Public Control Methods
     
     func setPower(isOn: Bool) {
-        if isScreenMirroringActive { stopScreenMirroring() }
-        guard isDeviceControlReady else { return }
-        sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x01, payload: [isOn ? 0x01 : 0x00])
-        DispatchQueue.main.async { self.isDeviceOn = isOn }
+        // This is a user action, so switch to manual mode.
+        if activeLightMode != .manual {
+            activeLightMode = .manual
+        }
+        setPower(isOn: isOn, internalOnly: false)
     }
     
-    func setBrightness(level: UInt8) {
-        if isScreenMirroringActive { stopScreenMirroring() }
-        guard isDeviceControlReady else { return }
-        let clampedLevel = min(max(level, 0), 100)
-        let devicePayloadLevel = UInt8(round((Double(clampedLevel) / 100.0) * 254.0))
-        sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x04, payload: [devicePayloadLevel])
-        DispatchQueue.main.async { self.currentBrightness = clampedLevel }
-    }
+    
+
+        // ** NEW FUNCTION for live, throttled updates **
+        func setLiveBrightness(level: UInt8) {
+            // Immediately update the UI for a responsive feel
+            self.currentBrightness = level
+            
+            // Throttle the BLE command
+            guard Date().timeIntervalSince(lastBrightnessUpdateTime) > brightnessUpdateThrottle else {
+                return
+            }
+            
+            // If enough time has passed, send the command
+            lastBrightnessUpdateTime = Date()
+            sendBrightnessCommand(level: level)
+        }
+        
+        // ** RENAMED/UPDATED FUNCTION for final, guaranteed updates **
+        func setFinalBrightness(level: UInt8) {
+            // Ensure the mode is manual
+            if activeLightMode != .manual {
+                activeLightMode = .manual
+            }
+            // Always send the final command, ignoring the throttle
+            sendBrightnessCommand(level: level)
+        }
     
     func setColor(r: UInt8, g: UInt8, b: UInt8) {
-        guard isDeviceControlReady else { return }
+        if activeLightMode != .manual {
+            activeLightMode = .manual
+        }
         sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x05, payload: [0x02, r, g, b])
         DispatchQueue.main.async { self.currentColorRGB = (r, g, b) }
     }
+
+    // MARK: - Screen Mirroring
     
-    func userManuallySetColor(r: UInt8, g: UInt8, b: UInt8) {
-        if isScreenMirroringActive { stopScreenMirroring() }
-        setColor(r: r, g: g, b: b)
-    }
-    
-    func toggleScreenMirroring() {
-        if isScreenMirroringActive {
-            stopScreenMirroring()
-        } else {
-            startScreenMirroring()
-        }
-    }
-    
-    func startScreenMirroring() {
-        guard isDeviceControlReady, !isScreenMirroringActive else { return }
-        DispatchQueue.main.async {
-            if !self.isDeviceOn {
-                self.sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x01, payload: [0x01])
-                self.isDeviceOn = true
+    private func startScreenMirroringInternal() {
+        guard isDeviceControlReady else { return }
+        
+        guard let displayID = selectedDisplayID, let display = availableDisplays.first(where: { $0.displayID == displayID }) else {
+            print("[ScreenColorService] No selected or available display to mirror.")
+            DispatchQueue.main.async {
+                self.connectionStatus = "Error: Select a display to mirror."
+                self.activeLightMode = .manual // Revert on failure
             }
-            self.isScreenMirroringActive = true
+            return
+        }
+        
+        DispatchQueue.main.async {
             self.connectionStatus = "Screen Mirroring: Active"
-            self.lastSentScreenMirrorColorRGB = nil
-            self.lastSentScreenMirrorBrightness = nil
-            self.currentScreenAvgColor = nil
-            self.screenColorService.startMonitoring()
-            self.bleUpdateTimer?.invalidate()
-            self.bleUpdateTimer = Timer.scheduledTimer(
-                timeInterval: self.bleMirrorUpdateInterval,
-                target: self,
-                selector: #selector(self.sendScreenColorToDevice),
-                userInfo: nil,
-                repeats: true
-            )
+            self.screenColorService.startMonitoring(for: display)
         }
     }
+
+    private func sendScreenColorToDevice(newScreenColorRGB: (r: UInt8, g: UInt8, b: UInt8)) {
+        guard activeLightMode == .screenMirroring else { return }
+
+        // Determine if color has changed enough to warrant sending an update
+        let colorChanged = lastSentColorRGB == nil || hasColorChangedSignificantly(from: lastSentColorRGB!, to: newScreenColorRGB, threshold: 10)
+        
+        if colorChanged {
+            sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x05, payload: [0x02, newScreenColorRGB.r, newScreenColorRGB.g, newScreenColorRGB.b])
+            self.lastSentColorRGB = newScreenColorRGB
+            DispatchQueue.main.async {
+                self.currentColorRGB = newScreenColorRGB
+            }
+        }
+    }
+
+    // MARK: - Rainbow Effect
     
-    func stopScreenMirroring() {
+    private func startRainbowEffectInternal() {
+        guard isDeviceControlReady else { return }
+        self.currentHue = 0.0
         DispatchQueue.main.async {
-            guard self.isScreenMirroringActive || self.bleUpdateTimer != nil else { return }
-            self.isScreenMirroringActive = false
-            self.screenColorService.stopMonitoring()
-            self.bleUpdateTimer?.invalidate()
-            self.bleUpdateTimer = nil
-            if self.connectedPeripheral != nil && self.isDeviceControlReady {
-                self.connectionStatus = "Connected: Govee control ready!"
-            }
+            self.connectionStatus = "Effect Active: Rainbow"
+            self.activeEffectTimer = Timer.scheduledTimer(timeInterval: 0.1, target: self, selector: #selector(self.updateRainbowEffect), userInfo: nil, repeats: true)
         }
     }
     
-    @objc private func sendScreenColorToDevice() {
-        guard isScreenMirroringActive, let newScreenColorRGB = currentScreenAvgColor else { return }
-        let screenLuminance = max(newScreenColorRGB.r, newScreenColorRGB.g, newScreenColorRGB.b)
-        let targetBrightnessPercent = UInt8(round((Double(screenLuminance) / 255.0) * 100.0))
-        let targetPowerState = targetBrightnessPercent >= 3
+    @objc private func updateRainbowEffect() {
+        currentHue += 0.01 // Adjust for speed
+        if currentHue > 1.0 { currentHue -= 1.0 }
+
+        let color = Color(hue: currentHue, saturation: 1.0, brightness: 1.0)
+        let rgb = color.toRGBBytes()
         
-        if targetBrightnessPercent < 3 {
-            if self.isDeviceOn {
-                sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x01, payload: [0x00])
-                DispatchQueue.main.async { self.isDeviceOn = false }
-                lastSentScreenMirrorBrightness = 0
-                lastSentScreenMirrorColorRGB = (0,0,0)
-                DispatchQueue.main.async {
-                    self.currentBrightness = 0
-                    self.currentColorRGB = (0,0,0)
+        // No need for change detection here, we always want a smooth transition
+        sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x05, payload: [0x02, rgb.r, rgb.g, rgb.b])
+        lastSentColorRGB = (rgb.r, rgb.g, rgb.b)
+        
+        DispatchQueue.main.async {
+            self.currentColorRGB = (rgb.r, rgb.g, rgb.b)
+        }
+    }
+
+    // MARK: - Display Management
+    
+    @MainActor
+    func updateAvailableDisplays() {
+        Task {
+            do {
+                let content = try await SCShareableContent.current
+                self.availableDisplays = content.displays.filter { $0.width > 0 && $0.height > 0 }
+                if selectedDisplayID == nil {
+                    self.selectedDisplayID = CGMainDisplayID()
                 }
-                return
-            }
-        } else {
-            if !self.isDeviceOn {
-                sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x01, payload: [0x01])
-                DispatchQueue.main.async { self.isDeviceOn = true }
-                lastSentScreenMirrorColorRGB = nil
-                lastSentScreenMirrorBrightness = nil
-            }
-        }
-        
-        if self.isDeviceOn {
-            let brightnessChanged = lastSentScreenMirrorBrightness == nil ||
-            abs(Int(lastSentScreenMirrorBrightness!) - Int(targetBrightnessPercent)) > 2
-            let colorChanged = lastSentScreenMirrorColorRGB == nil ||
-            hasColorChangedSignificantly(from: lastSentScreenMirrorColorRGB!, to: newScreenColorRGB, threshold: 15)
-            
-            if brightnessChanged {
-                let scaledDeviceBrightness = UInt8(round((Double(targetBrightnessPercent) / 100.0) * 254.0))
-                sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x04, payload: [scaledDeviceBrightness])
-                DispatchQueue.main.async { self.currentBrightness = targetBrightnessPercent }
-                lastSentScreenMirrorBrightness = targetBrightnessPercent
-            }
-            
-            if colorChanged {
-                setColor(r: newScreenColorRGB.r, g: newScreenColorRGB.g, b: newScreenColorRGB.b)
-                lastSentScreenMirrorColorRGB = newScreenColorRGB
+                print("[DisplayManager] Found \(self.availableDisplays.count) displays.")
+            } catch {
+                print("[DisplayManager] Could not get shareable content: \(error.localizedDescription)")
             }
         }
     }
     
-    private func hasColorChangedSignificantly(from o: (r:UInt8,g:UInt8,b:UInt8), to n: (r:UInt8,g:UInt8,b:UInt8), threshold: Int) -> Bool {
-        abs(Int(o.r)-Int(n.r))+abs(Int(o.g)-Int(n.g))+abs(Int(o.b)-Int(n.b)) > threshold
-    }
+    private func sendBrightnessCommand(level: UInt8) {
+            guard isDeviceControlReady else { return }
+            
+            // Switch to manual mode if not already
+            if activeLightMode != .manual {
+                DispatchQueue.main.async { self.activeLightMode = .manual }
+            }
+
+            let clampedLevel = min(max(level, 0), 100)
+            let devicePayloadLevel = UInt8(round((Double(clampedLevel) / 100.0) * 254.0))
+            sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x04, payload: [devicePayloadLevel])
+            
+            // Update the published property for the UI text, if it's not already set
+            if self.currentBrightness != clampedLevel {
+               DispatchQueue.main.async { self.currentBrightness = clampedLevel }
+            }
+        }
+        
+    
+    // MARK: - BLE Core Logic
     
     func startScanning() {
         guard cbManager.state == .poweredOn else {
@@ -244,10 +306,8 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         discoveredPeripherals.removeAll()
         cbManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         isScanning = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20.0) {
-            if self.isScanning {
-                self.stopScanning()
-            }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) {
+            if self.isScanning { self.stopScanning() }
         }
     }
     
@@ -255,71 +315,103 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         if isScanning {
             cbManager.stopScan()
             isScanning = false
+            if discoveredPeripherals.isEmpty {
+                connectionStatus = "No devices found. Try scanning again."
+            }
         }
     }
     
     func connect(to peripheral: CBPeripheral) {
-        if let existing = connectedPeripheral, existing.identifier == peripheral.identifier, (existing.state == .connected || existing.state == .connecting) {
-            return
-        }
-        if peripheral.state == .connecting {
-            return
-        }
         stopScanning()
         connectionStatus = "Connecting to \(peripheral.name ?? "device")..."
         cbManager.connect(peripheral, options: nil)
     }
     
     func disconnect() {
-        guard let peripheral = connectedPeripheral else {
-            connectionStatus = "Not connected to any device."
-            return
-        }
+        guard let peripheral = connectedPeripheral else { return }
+        stopAllModes()
         stopKeepAliveTimer()
-        stopScreenMirroring()
         isDeviceControlReady = false
         connectionStatus = "Disconnecting from \(peripheral.name ?? "device")..."
         cbManager.cancelPeripheralConnection(peripheral)
     }
+
+    // MARK: - Internal Helpers
+    
+    /// A version of setPower for internal mode changes that doesn't alter the light mode.
+    private func setPower(isOn: Bool, internalOnly: Bool) {
+        guard isDeviceControlReady else { return }
+        sendGoveePacket(head: GOVEE_COMMAND_HEAD, cmd: 0x01, payload: [isOn ? 0x01 : 0x00])
+        DispatchQueue.main.async { self.isDeviceOn = isOn }
+    }
+    
+    private func sendGoveePacket(head: UInt8, cmd: UInt8, payload: [UInt8]) {
+        guard let peripheral = connectedPeripheral, let char = controlCharacteristic, payload.count <= 17 else { return }
+        
+        var frame: [UInt8] = [head, cmd]
+        frame.append(contentsOf: payload)
+        let padding = [UInt8](repeating: 0, count: 19 - frame.count)
+        frame.append(contentsOf: padding)
+        
+        let checksum = frame.reduce(0, ^)
+        let data = Data(frame + [checksum])
+        
+        peripheral.writeValue(data, for: char, type: .withoutResponse)
+    }
+    
+    @objc private func sendKeepAliveCommand() {
+        sendGoveePacket(head: GOVEE_KEEP_ALIVE_HEAD, cmd: 0x01, payload: [0x01])
+    }
+    
+    private func startKeepAliveTimer() {
+        stopKeepAliveTimer()
+        DispatchQueue.main.async {
+            self.keepAliveTimer = Timer.scheduledTimer(timeInterval: 5.0, target: self, selector: #selector(self.sendKeepAliveCommand), userInfo: nil, repeats: true)
+        }
+    }
+    
+    private func stopKeepAliveTimer() {
+        keepAliveTimer?.invalidate()
+        keepAliveTimer = nil
+    }
+    
+    private func hasColorChangedSignificantly(from o: (r:UInt8,g:UInt8,b:UInt8), to n: (r:UInt8,g:UInt8,b:UInt8), threshold: Int) -> Bool {
+        abs(Int(o.r)-Int(n.r)) + abs(Int(o.g)-Int(n.g)) + abs(Int(o.b)-Int(n.b)) > threshold
+    }
+
+    // MARK: - CBCentralManagerDelegate
     
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         DispatchQueue.main.async {
-            var newStatus = self.connectionStatus
-            var shouldClearAndStopActivities = false
-            
             switch central.state {
-            case .poweredOn: newStatus = "Bluetooth is On. Ready to scan."
-            case .poweredOff: newStatus = "Bluetooth is Off. Please turn it on."; shouldClearAndStopActivities = true
-            case .unauthorized: newStatus = "Bluetooth access unauthorized. Go to System Settings > Privacy & Security > Bluetooth."; shouldClearAndStopActivities = true
-            case .unsupported: newStatus = "Bluetooth is not supported on this Mac."; shouldClearAndStopActivities = true
-            case .resetting: newStatus = "Bluetooth is resetting. Please wait."; if self.isScanning { self.stopScanning() }
-            case .unknown: newStatus = "Bluetooth state is unknown."; shouldClearAndStopActivities = true
-            @unknown default: newStatus = "An unexpected Bluetooth state: \(central.state.rawValue)."; shouldClearAndStopActivities = true
-            }
-            
-            self.connectionStatus = newStatus
-            if shouldClearAndStopActivities {
-                self.isScanning = false
-                self.discoveredPeripherals.removeAll()
-                self.stopKeepAliveTimer()
-                self.stopScreenMirroring()
-                self.isDeviceControlReady = false
-                if self.connectedPeripheral != nil {
-                    self.connectedPeripheral = nil
-                    self.controlCharacteristic = nil
-                }
-                self.isDeviceOn = false
-                self.currentBrightness = 50
-                self.currentColorRGB = (255,255,255)
+            case .poweredOn: 
+                self.connectionStatus = "Bluetooth is On. Ready to scan."
+                if self.connectedPeripheral == nil {
+                                    self.startScanning()
+                                }
+            case .poweredOff:
+                self.connectionStatus = "Bluetooth is Off. Please turn it on."
+                self.cleanupOnBluetoothError()
+            case .unauthorized:
+                self.connectionStatus = "Bluetooth access unauthorized. Go to System Settings > Privacy & Security > Bluetooth."
+                self.cleanupOnBluetoothError()
+            default:
+                self.connectionStatus = "Bluetooth is \(central.state.description)."
+                self.cleanupOnBluetoothError()
             }
         }
     }
     
+    private func cleanupOnBluetoothError() {
+        disconnect()
+        self.isScanning = false
+        self.discoveredPeripherals.removeAll()
+        self.isDeviceControlReady = false
+    }
+
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
         DispatchQueue.main.async {
-            if let index = self.discoveredPeripherals.firstIndex(where: { $0.identifier == peripheral.identifier }) {
-                self.discoveredPeripherals[index] = peripheral
-            } else {
+            if !self.discoveredPeripherals.contains(where: { $0.identifier == peripheral.identifier }) {
                 self.discoveredPeripherals.append(peripheral)
             }
         }
@@ -327,10 +419,8 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         DispatchQueue.main.async {
-            self.connectionStatus = "Connected to \(peripheral.name ?? "device"). Discovering services..."
+            self.connectionStatus = "Connected. Discovering services..."
             self.connectedPeripheral = peripheral
-            self.controlCharacteristic = nil
-            self.isDeviceControlReady = false
             peripheral.delegate = self
             peripheral.discoverServices(nil)
         }
@@ -338,51 +428,28 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         DispatchQueue.main.async {
-            self.connectionStatus = "Failed to connect to \(peripheral.name ?? "device"): \(error?.localizedDescription ?? "Unknown")"
-            if self.connectedPeripheral?.identifier == peripheral.identifier {
-                self.connectedPeripheral = nil
-                self.controlCharacteristic = nil
-                self.isDeviceControlReady = false
-                self.stopKeepAliveTimer()
-                self.stopScreenMirroring()
-            }
+            self.connectionStatus = "Failed to connect: \(error?.localizedDescription ?? "Unknown")"
+            self.connectedPeripheral = nil
         }
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         DispatchQueue.main.async {
-            let name = peripheral.name ?? "device"
-            if let err = error {
-                self.connectionStatus = "Disconnected from \(name): \(err.localizedDescription)"
-            } else {
-                self.connectionStatus = "Disconnected from \(name)."
-            }
-            
-            if self.connectedPeripheral?.identifier == peripheral.identifier {
-                self.connectedPeripheral = nil
-                self.controlCharacteristic = nil
-                self.isDeviceControlReady = false
-                self.stopKeepAliveTimer()
-                self.stopScreenMirroring()
-                self.isDeviceOn = false
-                self.currentBrightness = 50
-                self.currentColorRGB = (255, 255, 255)
-            }
+            self.connectionStatus = "Disconnected. Scan to find devices."
+            self.connectedPeripheral = nil
+            self.controlCharacteristic = nil
+            self.isDeviceControlReady = false
+            self.stopKeepAliveTimer()
+            self.stopAllModes()
         }
     }
     
+    // MARK: - CBPeripheralDelegate
+    
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         DispatchQueue.main.async {
-            if let err = error {
-                self.connectionStatus = "Error discovering services on \(peripheral.name ?? ""): \(err.localizedDescription)"
-                return
-            }
-            guard let services = peripheral.services, !services.isEmpty else {
-                self.connectionStatus = "No services found on \(peripheral.name ?? "")."
-                self.isDeviceControlReady = false
-                return
-            }
-            self.connectionStatus = "Services found. Looking for Govee control characteristic..."
+            guard let services = peripheral.services else { return }
+            self.connectionStatus = "Services found. Discovering characteristics..."
             for service in services {
                 peripheral.discoverCharacteristics([GOVEE_CONTROL_CHARACTERISTIC_UUID], for: service)
             }
@@ -391,21 +458,12 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         DispatchQueue.main.async {
-            if let err = error {
-                self.connectionStatus = "Error discovering characteristics for service \(service.uuid.uuidString): \(err.localizedDescription)"
-                return
-            }
-            guard let chars = service.characteristics, !chars.isEmpty else {
-                return
-            }
-            for char in chars {
-                if char.uuid == GOVEE_CONTROL_CHARACTERISTIC_UUID {
-                    self.controlCharacteristic = char
-                    self.isDeviceControlReady = true
-                    self.connectionStatus = "Connected: Govee control ready!"
-                    self.startKeepAliveTimer()
-                    return
-                }
+            guard let characteristics = service.characteristics else { return }
+            if let controlChar = characteristics.first(where: { $0.uuid == GOVEE_CONTROL_CHARACTERISTIC_UUID }) {
+                self.controlCharacteristic = controlChar
+                self.isDeviceControlReady = true
+                self.connectionStatus = "Govee control ready!"
+                self.startKeepAliveTimer()
             }
         }
     }

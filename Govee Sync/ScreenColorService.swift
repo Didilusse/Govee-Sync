@@ -14,70 +14,57 @@ import AVFoundation
 class ScreenColorService: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private let ciContext: CIContext
-    private var currentDisplay: SCDisplay?
     
-    
+    // Closure to be called with the new average color, or nil on error/stop.
     var onNewAverageColor: ((r: UInt8, g: UInt8, b: UInt8)?) -> Void = { _ in }
     
-    
-    private let captureFPS: Int32 = 10
-    
-    private let captureWidth = 64
-    private let captureHeight = 36
+    // Configuration for the capture performance and quality.
+    private let settings: AppSettings
     
     
-    override init() {
+    init(settings: AppSettings) {
+        self.settings = settings
         self.ciContext = CIContext(options: [CIContextOption.priorityRequestLow: true])
         super.init()
         print("[ScreenColorService] Initialized.")
     }
     
+    deinit {
+        stopMonitoring()
+        print("[ScreenColorService] Deinitialized.")
+    }
+    
     @MainActor
-    func startMonitoring() {
+    func startMonitoring(for display: SCDisplay) {
         guard stream == nil else {
             print("[ScreenColorService] Monitoring is already active.")
             return
         }
-        print("[ScreenColorService] Attempting to start screen monitoring with ScreenCaptureKit...")
+        
+        print("[ScreenColorService] Attempting to start screen monitoring for display \(display.displayID)...")
         
         Task {
             do {
-                let content = try await SCShareableContent.current
-                
-                
-                self.currentDisplay = content.displays.first { $0.displayID == CGMainDisplayID() && $0.width > 0 && $0.height > 0 }
-                
-                guard let displayToCapture = self.currentDisplay else {
-                    print("[ScreenColorService] No suitable display found to capture (e.g., main display not active).")
-                    self.onNewAverageColor(nil)
-                    return
-                }
-                
-                print("[ScreenColorService] Target display: ID \(displayToCapture.displayID), Size: \(displayToCapture.width)x\(displayToCapture.height)")
-                
-                
-                let filter = SCContentFilter(display: displayToCapture, excludingWindows: [])
+                // The content filter now uses the specific display passed to the function.
+                let filter = SCContentFilter(display: display, excludingWindows: [])
                 
                 let config = SCStreamConfiguration()
-                
-                config.width = self.captureWidth
-                config.height = self.captureHeight
-                config.minimumFrameInterval = CMTime(value: 1, timescale: self.captureFPS)
+                config.width = settings.captureWidth
+                config.height = settings.captureHeight
+                config.minimumFrameInterval = CMTime(value: 1, timescale: Int32(settings.captureFPS))
                 config.pixelFormat = kCVPixelFormatType_32BGRA
                 config.capturesAudio = false
                 config.showsCursor = false
-                config.queueDepth = 3
-                
+                config.queueDepth = 3 
                 
                 self.stream = SCStream(filter: filter, configuration: config, delegate: self)
                 
-                
+                // Add the stream output with a background queue for processing.
                 try self.stream?.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue.global(qos: .userInitiated))
-                
                 
                 try await self.stream?.startCapture()
                 
-                print("[ScreenColorService] ScreenCaptureKit stream started successfully.")
+                print("[ScreenColorService] ScreenCaptureKit stream started successfully for display \(display.displayID).")
                 
             } catch {
                 print("[ScreenColorService] Error starting ScreenCaptureKit stream: \(error.localizedDescription)")
@@ -88,15 +75,17 @@ class ScreenColorService: NSObject, SCStreamOutput, SCStreamDelegate {
     }
     
     func stopMonitoring() {
-        DispatchQueue.main.async {
-            guard self.stream != nil else { return }
-            print("[ScreenColorService] Attempting to stop ScreenCaptureKit stream.")
-            self.stream?.stopCapture { [weak self] error in
-                if let error = error {
-                    print("[ScreenColorService] Error stopping stream: \(error.localizedDescription)")
-                } else {
-                    print("[ScreenColorService] Stream stopped successfully.")
-                }
+        guard let stream = self.stream else { return }
+        
+        print("[ScreenColorService] Attempting to stop ScreenCaptureKit stream.")
+        stream.stopCapture { [weak self] error in
+            if let error = error {
+                print("[ScreenColorService] Error stopping stream: \(error.localizedDescription)")
+            } else {
+                print("[ScreenColorService] Stream stopped successfully.")
+            }
+            // Ensure state is cleaned up on the main thread if needed by UI.
+            DispatchQueue.main.async {
                 self?.stream = nil
                 self?.onNewAverageColor(nil)
             }
@@ -104,16 +93,19 @@ class ScreenColorService: NSObject, SCStreamOutput, SCStreamDelegate {
     }
     
     // MARK: - SCStreamOutput Delegate
+    
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
+        // Ensure we have a valid screen sample buffer
         guard outputType == .screen, CMSampleBufferIsValid(sampleBuffer) else { return }
         
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            // print("[ScreenColorService] Could not get CVPixelBuffer from sample buffer.")
             return
         }
         
+        // Create a CIImage from the pixel buffer
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         
+        // Use the highly efficient "CIAreaAverage" filter to get the average color.
         let filterName = "CIAreaAverage"
         guard let filter = CIFilter(name: filterName) else {
             print("[ScreenColorService] Could not create \(filterName) filter.")
@@ -125,11 +117,11 @@ class ScreenColorService: NSObject, SCStreamOutput, SCStreamDelegate {
         filter.setValue(CIVector(cgRect: ciImage.extent), forKey: kCIInputExtentKey)
         
         guard let outputImage = filter.outputImage else {
-            // print("[ScreenColorService] Failed to get outputImage from \(filterName) filter")
             self.onNewAverageColor(nil)
             return
         }
         
+        // Render the 1x1 output image to a bitmap to extract RGBA values.
         var bitmap = [UInt8](repeating: 0, count: 4)
         
         self.ciContext.render(outputImage,
@@ -143,6 +135,7 @@ class ScreenColorService: NSObject, SCStreamOutput, SCStreamDelegate {
         let g = bitmap[1]
         let b = bitmap[2]
         
+        // Send the new color to the manager.
         self.onNewAverageColor((r, g, b))
     }
     
@@ -151,15 +144,6 @@ class ScreenColorService: NSObject, SCStreamOutput, SCStreamDelegate {
         DispatchQueue.main.async {
             self.stream = nil
             self.onNewAverageColor(nil)
-            
         }
-    }
-    
-    
-    
-    
-    deinit {
-        stopMonitoring()
-        print("[ScreenColorService] Deinitialized.")
     }
 }

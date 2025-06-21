@@ -13,6 +13,8 @@ struct GoveeBLEApp: App {
         WindowGroup {
             ContentView()
                 .frame(minWidth: 600, minHeight: 400)
+                .accentColor(.blue)
         }
+        .windowStyle(.hiddenTitleBar) 
     }
 }

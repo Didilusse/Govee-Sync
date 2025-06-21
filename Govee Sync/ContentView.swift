@@ -1,107 +1,195 @@
-// ContentView.swift
 import SwiftUI
-
+import ScreenCaptureKit
 
 struct ContentView: View {
-    @StateObject private var bleManager = GoveeBLEManager()
+    // Create the AppSettings object as a StateObject at the root of the view hierarchy.
+    @StateObject private var appSettings = AppSettings()
+    
+    // The BLE Manager is now initialized with the settings object.
+    @StateObject private var bleManager: GoveeBLEManager
+    
+    init() {
+        let settings = AppSettings()
+        _appSettings = StateObject(wrappedValue: settings)
+        _bleManager = StateObject(wrappedValue: GoveeBLEManager(settings: settings))
+    }
     
     var body: some View {
-        VStack(spacing: 10) {
-            Text("Govee LED Controller")
-                .font(.title)
-                .padding(.top)
+        TabView {
+            ControlsView()
+                .tabItem {
+                    Label("Controls", systemImage: "slider.horizontal.3")
+                }
             
-            Text(bleManager.connectionStatus)
-                .padding()
-                .multilineTextAlignment(.center)
-                .foregroundColor(bleManager.connectionStatus.lowercased().contains("unauthorized") || bleManager.connectionStatus.lowercased().contains("off") || bleManager.connectionStatus.lowercased().contains("error") ? .red : .primary)
-                .fixedSize(horizontal: false, vertical: true)
+            SettingsView()
+                .tabItem {
+                    Label("Settings", systemImage: "gear")
+                }
+        }
+        // Pass the objects into the environment for easy access by child views.
+        .environmentObject(appSettings)
+        .environmentObject(bleManager)
+        .frame(minWidth: 450, idealWidth: 500, maxWidth: 600, minHeight: 500, idealHeight: 550, maxHeight: 650)
+    }
+}
+
+// MARK: - Controls Tab View
+
+struct ControlsView: View {
+    @EnvironmentObject var bleManager: GoveeBLEManager
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("Govee Sync")
+                .font(.title)
+                .fontWeight(.medium)
+                .padding(.top)
+
+            StatusView(status: bleManager.connectionStatus)
             
             if bleManager.connectedPeripheral == nil {
-                Button(bleManager.isScanning ? "Stop Scan" : "Scan for Devices") {
-                    if bleManager.isScanning { bleManager.stopScanning() } else { bleManager.startScanning() }
-                }
-                .padding().buttonStyle(.borderedProminent)
-                
-                if bleManager.isScanning && bleManager.discoveredPeripherals.isEmpty {
-                    ProgressView("Scanning...").padding()
-                } else if !bleManager.discoveredPeripherals.isEmpty {
-                    List {
-                        Section("Discovered Devices") {
-                            ForEach(bleManager.discoveredPeripherals, id: \.identifier) { peripheral in
-                                HStack { Text(peripheral.name ?? "Unknown (\(peripheral.identifier.uuidString.prefix(4)))"); Spacer(); Button("Connect") { bleManager.connect(to: peripheral) }.buttonStyle(.bordered) }
-                            }
-                        }
-                    }.frame(maxHeight: 200)
-                } else if !bleManager.isScanning { Text("No devices found. Try scanning.").padding() }
-                
+                ConnectionView()
             } else {
-                
-                VStack(alignment: .leading, spacing: 15) {
-                    Text("Connected to: \(bleManager.connectedPeripheral?.name ?? "Govee Device")")
-                        .font(.headline)
-                        .padding(.bottom, 5)
-                    
-                    if bleManager.isDeviceControlReady {
-                        
-                        Toggle("Power", isOn: Binding(
-                            get: { bleManager.isDeviceOn },
-                            set: { bleManager.setPower(isOn: $0) }
-                        ))
-                        
-                        HStack {
-                            Text("Brightness: \(Int(bleManager.currentBrightness))%")
-                            Slider(value: Binding(
-                                get: { Double(bleManager.currentBrightness) },
-                                set: { newValueFromSlider in
-                                    let newBrightnessUInt8 = UInt8(newValueFromSlider.rounded())
-                                    bleManager.setBrightness(level: newBrightnessUInt8)
-                                }
-                            ),
-                                   in: 0...100, step: 1,
-                                   onEditingChanged: { editingFinished in
-                                if editingFinished { bleManager.setBrightness(level: bleManager.currentBrightness) }
-                            })
+                DeviceControlView()
+            }
+        }
+        .padding([.horizontal, .bottom])
+    }
+}
+
+// MARK: - Subviews (Status, Connection, DeviceControl)
+
+struct StatusView: View {
+    let status: String
+    
+    var body: some View {
+        Text(status)
+            .padding(10)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .cornerRadius(8)
+            .padding(.vertical)
+    }
+}
+
+struct ConnectionView: View {
+    @EnvironmentObject var bleManager: GoveeBLEManager
+    
+    var body: some View {
+        VStack {
+            Button(bleManager.isScanning ? "Stop Scan" : "Scan for Devices") {
+                if bleManager.isScanning { bleManager.stopScanning() }
+                else { bleManager.startScanning() }
+            }
+            .keyboardShortcut("s", modifiers: .command)
+            .buttonStyle(.borderedProminent)
+            
+            Spacer()
+            
+            if bleManager.isScanning {
+                ProgressView("Scanning...")
+            }
+            
+            if !bleManager.discoveredPeripherals.isEmpty {
+                List {
+                    Section("Discovered Devices") {
+                        ForEach(bleManager.discoveredPeripherals, id: \.identifier) { peripheral in
+                            HStack {
+                                Text(peripheral.name ?? "Unknown Device")
+                                Spacer()
+                                Button("Connect") { bleManager.connect(to: peripheral) }
+                                    .buttonStyle(.bordered)
+                            }
                         }
-                        
-                        // Screen Mirroring Toggle
-                        Toggle("Screen Mirroring", isOn: $bleManager.isScreenMirroringActive.animation())
-                            .onChange(of: bleManager.isScreenMirroringActive) { newValue in
-                                bleManager.toggleScreenMirroring()
-                            }
-                        
-                        ColorPicker("Manual Color", selection: Binding(
-                            get: { Color.fromRGB(r: bleManager.currentColorRGB.r,
-                                                 g: bleManager.currentColorRGB.g,
-                                                 b: bleManager.currentColorRGB.b) },
-                            set: { newColor in
-                                if bleManager.isScreenMirroringActive {
-                                    bleManager.stopScreenMirroring()
-                                }
-                                let rgbBytes = newColor.toRGBBytes()
-                                bleManager.setColor(r: rgbBytes.r, g: rgbBytes.g, b: rgbBytes.b)
-                            }
-                        ), supportsOpacity: false)
-                        .disabled(bleManager.isScreenMirroringActive)
-                        
-                    } else {
-                        Text("Device connected, waiting for control service...").padding(.vertical)
-                        ProgressView()
                     }
-                    
-                    Spacer()
-                    Button(action: {
-                        bleManager.disconnect()
-                    }) {
-                        Text("Disconnect")
-                    }
-                    .buttonStyle(.borderedProminent).tint(.red)
                 }
-                .padding()
+                .listStyle(.inset(alternatesRowBackgrounds: true))
+                .frame(maxHeight: .infinity)
+            } else if !bleManager.isScanning {
+                Text("No devices found.\nEnsure your Govee light is on and in range.")
+                    .multilineTextAlignment(.center)
+                    .foregroundColor(.secondary)
             }
             Spacer()
         }
-        .padding()
-        .frame(minWidth: 400, minHeight: 450)
+    }
+}
+
+struct DeviceControlView: View {
+    @EnvironmentObject var bleManager: GoveeBLEManager
+    
+    var body: some View {
+        VStack {
+            if !bleManager.isDeviceControlReady {
+                Spacer()
+                ProgressView("Initializing device controls...")
+                Spacer()
+            } else {
+                Form {
+                    Section(header: Text("Main Controls")) {
+                        Toggle(isOn: Binding(
+                            get: { bleManager.isDeviceOn },
+                            set: { bleManager.setPower(isOn: $0) }
+                        )) {
+                            Label("Power", systemImage: "power")
+                        }
+                        
+                        HStack {
+                            Label("Brightness", systemImage: "sun.max.fill")
+                            Slider(value: Binding(
+                                get: { Double(bleManager.currentBrightness) },
+                                set: { newValue in bleManager.setLiveBrightness(level: UInt8(newValue)) }
+                            ), in: 0...100, step: 1, onEditingChanged: { isEditing in
+                                if !isEditing { bleManager.setFinalBrightness(level: bleManager.currentBrightness) }
+                            })
+                            Text("\(Int(bleManager.currentBrightness))%")
+                                .frame(width: 40)
+                        }
+                    }
+                    
+                    Section(header: Text("Light Mode")) {
+                        Picker("Mode", selection: $bleManager.activeLightMode) {
+                            ForEach(GoveeBLEManager.LightMode.allCases) { mode in
+                                Text(mode.description).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+
+                        switch bleManager.activeLightMode {
+                        case .manual:
+                            ColorPicker(selection: Binding(
+                                get: { Color.fromRGB(r: bleManager.currentColorRGB.r, g: bleManager.currentColorRGB.g, b: bleManager.currentColorRGB.b) },
+                                set: { newColor in let rgb = newColor.toRGBBytes(); bleManager.setColor(r: rgb.r, g: rgb.g, b: rgb.b) }
+                            ), supportsOpacity: false) {
+                                Label("Color", systemImage: "paintpalette.fill")
+                            }
+                        case .screenMirroring:
+                            Picker(selection: $bleManager.selectedDisplayID) {
+                                ForEach(bleManager.availableDisplays, id: \.displayID) { display in
+                                    Text("Display \(display.displayID): \(display.width)x\(display.height)").tag(display.displayID as CGDirectDisplayID?)
+                                }
+                            } label: { Label("Source Display", systemImage: "display") }
+                            .onAppear(perform: bleManager.updateAvailableDisplays)
+
+                        case .rainbow:
+                            Label("A dynamic, colorful effect.", systemImage: "rainbow")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+            
+            Spacer()
+            
+            Button(role: .destructive) {
+                bleManager.disconnect()
+            } label: {
+                Text("Disconnect from \(bleManager.connectedPeripheral?.name ?? "Device")")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+        }
     }
 }

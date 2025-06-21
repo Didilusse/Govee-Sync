@@ -25,29 +25,28 @@ extension Color {
 
         #if canImport(AppKit) && !targetEnvironment(macCatalyst)
         NSColor(self).usingColorSpace(.sRGB)?.getRed(&red, green: &green, blue: &blue, alpha: &opacity) ?? {
-            
             print("Warning: Could not convert color to sRGB for component extraction. Using direct components if available.")
             NSColor(self).getRed(&red, green: &green, blue: &blue, alpha: &opacity)
         }()
         #else
+        // Fallback for non-macOS platforms if this code were to be reused
         if let cgColor = self.cgColor {
-            if cgColor.numberOfComponents >= 3 {
-                 let components = cgColor.components
-                 red = components?[0] ?? 0
-                 green = components?[1] ?? 0
-                 blue = components?[2] ?? 0
-                 // opacity = components.count >= 4 ? (components?[3] ?? 1) : 1
-            } else if cgColor.numberOfComponents == 2 { // Grayscale
-                 let white = cgColor.components?[0] ?? 0
-                 red = white; green = white; blue = white
-                 // opacity = cgColor.components?[1] ?? 1
+            if let components = cgColor.components {
+                if cgColor.numberOfComponents >= 3 {
+                    red = components[0]
+                    green = components[1]
+                    blue = components[2]
+                } else if cgColor.numberOfComponents == 2 { // Grayscale
+                    let white = components[0]
+                    red = white; green = white; blue = white
+                }
             }
         } else {
              print("Warning: CGColor not available for Color to RGB conversion.")
         }
         #endif
         
-        return RGBBytes(r: UInt8(max(0,min(1,red)) * 255.0), 
+        return RGBBytes(r: UInt8(max(0,min(1,red)) * 255.0),
                         g: UInt8(max(0,min(1,green)) * 255.0),
                         b: UInt8(max(0,min(1,blue)) * 255.0))
     }
