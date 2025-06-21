@@ -7,6 +7,7 @@ struct SettingsView: View {
         VStack(alignment: .leading) {
             Text("Settings")
                 .font(.system(size: 24, weight: .bold))
+                .foregroundColor(appSettings.accentColor) // Apply accent color to the title
                 .padding([.top, .horizontal], 20)
                 .padding(.bottom, 10)
             
@@ -14,18 +15,26 @@ struct SettingsView: View {
                 .padding(.horizontal, 20)
             
             Form {
+                
+                Section(header: Text("Appearance")) {
+                    ColorPicker("Accent Color", selection: $appSettings.accentColor, supportsOpacity: false)
+                        .padding(.vertical, 6)
+                }
+                
                 Section {
                     ToggleRow(
                         title: "Turn On on Connect",
                         icon: "power.circle.fill",
                         isOn: $appSettings.powerOnConnect
                     )
-                    
+                    .tint(appSettings.accentColor) // This forces the toggle switch to use the accent color.
+
                     ToggleRow(
                         title: "Turn Off on Disconnect",
                         icon: "bolt.slash.fill",
                         isOn: $appSettings.powerOffDisconnect
                     )
+                    .tint(appSettings.accentColor) // This forces the toggle switch to use the accent color.
                 } header: {
                     SectionHeader("Automation")
                 }
@@ -84,7 +93,7 @@ struct SectionHeader: View {
     var body: some View {
         Text(title)
             .font(.headline)
-            .foregroundColor(.primary)
+            .foregroundColor(.secondary)
             .padding(.top, 8)
     }
 }
@@ -97,7 +106,6 @@ struct ToggleRow: View {
     var body: some View {
         Toggle(isOn: $isOn) {
             Label(title, systemImage: icon)
-                .foregroundColor(.primary)
                 .padding(.vertical, 6)
         }
         .toggleStyle(.switch)
@@ -115,7 +123,6 @@ struct StepperRow: View {
     var body: some View {
         HStack {
             Label(title, systemImage: icon)
-                .foregroundColor(.primary)
                 .frame(width: 150, alignment: .leading)
             
             Spacer()
@@ -129,6 +136,7 @@ struct StepperRow: View {
                 Text(title)
             }
             .labelsHidden()
+            .tint(Color.accentColor)
         }
         .padding(.vertical, 6)
     }
@@ -137,8 +145,10 @@ struct StepperRow: View {
 // MARK: - Preview
 struct SettingsView_Previews: PreviewProvider {
     static var previews: some View {
+        let settings = AppSettings()
         SettingsView()
-            .environmentObject(AppSettings())
+            .environmentObject(settings)
+            .accentColor(settings.accentColor) // Apply in preview
             .frame(width: 500, height: 600)
     }
 }
