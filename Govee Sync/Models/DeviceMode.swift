@@ -16,6 +16,7 @@ enum DeviceMode: CaseIterable, Identifiable {
     
     // Scene Effects
     case screenMirroring
+    case musicVisualizer
     case rainbow
     case pulse
     case breathe
@@ -30,6 +31,7 @@ enum DeviceMode: CaseIterable, Identifiable {
         switch self {
         case .manual: return "Manual"
         case .screenMirroring: return "Screen Sync"
+        case .musicVisualizer: return "Music Sync"
         case .rainbow: return "Rainbow"
         case .pulse: return "Pulse"
         case .breathe: return "Breathe"
@@ -50,6 +52,7 @@ enum DeviceMode: CaseIterable, Identifiable {
         switch self {
         case .manual: return "hand.tap.fill"
         case .screenMirroring: return "display"
+        case .musicVisualizer: return "music.note"
         case .rainbow: return "rainbow"
         case .pulse: return "waveform.path.ecg"
         case .breathe: return "lungs.fill"

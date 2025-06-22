@@ -17,13 +17,6 @@ struct ControlsView: View {
                 HStack {
                     Image(systemName: "lightbulb.led.fill")
                         .font(.title2)
-                        .foregroundStyle(
-                            LinearGradient(
-                                gradient: Gradient(colors: [appSettings.accentColor.opacity(0.7), appSettings.accentColor]),
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
                     Text("Govee Sync")
                         .font(.system(size: 24, weight: .bold))
                 }

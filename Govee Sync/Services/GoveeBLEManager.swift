@@ -29,14 +29,17 @@ extension CBManagerState: CustomStringConvertible {
 }
 
 class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
-
+    
     // MARK: - Published Properties
     @Published var isScanning: Bool = false
     @Published var discoveredPeripherals: [CBPeripheral] = []
     @Published var connectedPeripheral: CBPeripheral? = nil
     @Published var connectionStatus: String = "App Started. Initializing Bluetooth..."
     @Published var isDeviceControlReady: Bool = false
-
+    
+    @Published var lastConnectedPeripheral: CBPeripheral?
+    
+    
     @Published var isDeviceOn: Bool = false
     @Published var currentBrightness: UInt8 = 100
     @Published var currentColorRGB: (r: UInt8, g: UInt8, b: UInt8) = (255, 255, 255)
@@ -57,6 +60,8 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     private var cbManager: CBCentralManager!
     private var controlCharacteristic: CBCharacteristic?
     private let screenColorService: ScreenColorService
+    private let audioCaptureService: AudioCaptureService
+    
     private var keepAliveTimer: Timer?
     private var activeEffectTimer: Timer?
     private let appSettings: AppSettings
@@ -70,11 +75,12 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     // Effect state properties
     private var effectPhase: Double = 0.0
     private var effectBaseColor: (r: UInt8, g: UInt8, b: UInt8) = (255, 255, 255)
-
+    
     
     init(settings: AppSettings) {
         self.appSettings = settings
         self.screenColorService = ScreenColorService(settings: settings)
+        self.audioCaptureService = AudioCaptureService()
         super.init()
         cbManager = CBCentralManager(delegate: self, queue: nil)
         
@@ -85,12 +91,12 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         
         Task { await self.updateAvailableDisplays() }
     }
-
+    
     // MARK: - Mode & Effect Handling
-    private func handleModeChange(from oldMode: DeviceMode, to newMode: DeviceMode) {
+    @MainActor private func handleModeChange(from oldMode: DeviceMode, to newMode: DeviceMode) {
         print("[ModeChange] Switching from \(oldMode.description) to \(newMode.description)")
         stopAllModes() // Always stop old timers
-
+        
         if newMode != .manual && !isDeviceOn {
             self._internal_setPower(isOn: true)
         }
@@ -101,6 +107,12 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
                 guard self.activeDeviceMode == .screenMirroring else { return }
                 self.startScreenMirroringInternal()
             }
+        case .musicVisualizer:
+            // Start the audio service when this scene is selected
+            Task {
+                await audioCaptureService.startMonitoring()
+            }
+            connectionStatus = "Scene Active: Music Sync"
         case .rainbow:
             startEffect(selector: #selector(updateRainbowEffect), interval: 0.1)
         case .pulse:
@@ -128,6 +140,7 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     
     private func stopAllModes() {
         screenColorService.stopMonitoring()
+        audioCaptureService.stopMonitoring()
         activeEffectTimer?.invalidate()
         activeEffectTimer = nil
     }
@@ -145,6 +158,26 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     }
     
     // MARK: - Scene Update Logic
+    private func updateMusicVisualizer(level: Float) {
+        // Map volume to brightness. A lower bound prevents the light from turning off completely.
+        let brightness = UInt8(max(level * 254.0, 25.0))
+        
+        // Map volume to color. Quiet = Blue/Purple, Loud = Red/Orange
+        let hue = 0.7 - (CGFloat(level) * 0.7)
+        let color = Color(hue: hue, saturation: 1.0, brightness: 1.0)
+        let rgb = color.toRGBBytes()
+        
+        // Send the commands to the device
+        sendBrightnessCommand(rawDeviceLevel: brightness)
+        sendColorCommand(r: rgb.r, g: rgb.g, b: rgb.b)
+        
+        // Update the UI
+        DispatchQueue.main.async {
+            self.currentBrightness = UInt8(max(level * 100.0, 10.0))
+            self.currentColorRGB = (r: rgb.r, g: rgb.g, b: rgb.b)
+        }
+    }
+    
     @objc private func updateRainbowEffect() {
         effectPhase += 0.01; if effectPhase > 1.0 { effectPhase -= 1.0 }
         let color = Color(hue: effectPhase, saturation: 1.0, brightness: 1.0); let rgb = color.toRGBBytes()
@@ -195,7 +228,7 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
             sendBrightnessCommand(rawDeviceLevel: 254)
         }
     }
-
+    
     // MARK: - Public Control Methods
     func setPower(isOn: Bool) {
         if !isOn {
@@ -227,7 +260,7 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         }
         self._internal_setColor(r: r, g: g, b: b)
     }
-
+    
     // MARK: - Internal Commands & Helpers
     private func _internal_setPower(isOn: Bool) {
         guard isDeviceControlReady else { return }
@@ -240,7 +273,7 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         let devicePayloadLevel = UInt8(round((Double(clampedLevel) / 100.0) * 254.0))
         sendBrightnessCommand(rawDeviceLevel: devicePayloadLevel)
         if self.currentBrightness != clampedLevel {
-           DispatchQueue.main.async { self.currentBrightness = clampedLevel }
+            DispatchQueue.main.async { self.currentBrightness = clampedLevel }
         }
     }
     
@@ -353,6 +386,15 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
             switch central.state {
             case .poweredOn:
                 self.connectionStatus = "Bluetooth is On. Ready to scan."
+                
+                if let lastIDString = self.appSettings.lastConnectedDeviceID, let uuid = UUID(uuidString: lastIDString) {
+                    let knownPeripherals = central.retrievePeripherals(withIdentifiers: [uuid])
+                    if let lastPeripheral = knownPeripherals.first {
+                        // We found it! Update our property so the UI can show it.
+                        self.lastConnectedPeripheral = lastPeripheral
+                    }
+                }
+                
                 if self.connectedPeripheral == nil {
                     self.startScanning()
                 }
@@ -375,11 +417,16 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         self.discoveredPeripherals.removeAll()
         self.isDeviceControlReady = false
     }
-
+    
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
         DispatchQueue.main.async {
             if !self.discoveredPeripherals.contains(where: { $0.identifier == peripheral.identifier }) {
                 self.discoveredPeripherals.append(peripheral)
+            }
+            
+            
+            if peripheral.identifier.uuidString == self.appSettings.lastConnectedDeviceID {
+                self.lastConnectedPeripheral = peripheral
             }
         }
     }
@@ -389,6 +436,9 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
             self.connectionStatus = "Connected. Discovering services..."
             self.connectedPeripheral = peripheral
             peripheral.delegate = self
+            
+            self.appSettings.lastConnectedDeviceID = peripheral.identifier.uuidString
+            self.lastConnectedPeripheral = peripheral
             peripheral.discoverServices(nil)
         }
     }
@@ -429,10 +479,11 @@ class GoveeBLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
             if let controlChar = characteristics.first(where: { $0.uuid == GOVEE_CONTROL_CHARACTERISTIC_UUID }) {
                 self.controlCharacteristic = controlChar
                 self.isDeviceControlReady = true
-                self.connectionStatus = "Govee control ready!"
+                self.connectionStatus = "Govee Sync ready!"
                 self.startKeepAliveTimer()
                 if self.appSettings.powerOnConnect { self._internal_setPower(isOn: true) }
             }
         }
     }
 }
+

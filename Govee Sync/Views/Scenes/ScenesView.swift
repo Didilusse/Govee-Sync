@@ -3,7 +3,6 @@
 //  Govee Sync
 //
 //  Created by Adil Rahmani on 6/21/25.
-//  Updated with a robust pattern to fix compiler errors.
 //
 
 import SwiftUI
@@ -11,7 +10,6 @@ import SwiftUI
 struct ScenesView: View {
     @EnvironmentObject var bleManager: GoveeBLEManager
     
-    // Defines the grid layout for the scene buttons, adapting to window size.
     let columns = [
         GridItem(.adaptive(minimum: 120))
     ]
@@ -26,24 +24,52 @@ struct ScenesView: View {
             ScrollView {
                 LazyVGrid(columns: columns, spacing: 20) {
                     ForEach(DeviceMode.allCases.filter { $0.isScene }) { mode in
- 
+                        
+                        // Check if the current mode is the one we want to disable.
+                        let isWIP = mode == .musicVisualizer
+                        
                         Button(action: {
-                            bleManager.activeDeviceMode = mode
+                            // Only change the mode if it's not a work-in-progress feature.
+                            if !isWIP {
+                                bleManager.activeDeviceMode = mode
+                            }
                         }) {
                             SceneButtonView(mode: mode, isSelected: bleManager.activeDeviceMode == mode)
+                                // Apply visual effects to gray it out.
+                                .opacity(isWIP ? 0.4 : 1.0)
+                                .saturation(isWIP ? 0.2 : 1.0)
+                                // Add the "Work in Progress" overlay.
+                                .overlay(
+                                    ZStack {
+                                        if isWIP {
+                                            // Semi-transparent background for the text
+                                            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                                                .fill(Color.black.opacity(0.5))
+                                            
+                                            VStack(spacing: 4) {
+                                                Image(systemName: "wrench.and.screwdriver.fill")
+                                                Text("WIP")
+                                                    .font(.caption)
+                                                    .bold()
+                                            }
+                                            .foregroundColor(.white)
+                                        }
+                                    }
+                                )
                         }
                         .buttonStyle(.plain)
+                        .disabled(isWIP) // Fully disable the button's action.
                     }
                 }
                 .padding()
             }
         }
-        // The view is disabled if no device is connected, preventing user interaction.
         .disabled(bleManager.connectedPeripheral == nil || !bleManager.isDeviceControlReady)
     }
 }
 
-/// A purely visual component for displaying a scene. It no longer has an action closure.
+// NOTE: The SceneButtonView itself remains unchanged.
+// The logic is all handled within the main ScenesView.
 struct SceneButtonView: View {
     let mode: DeviceMode
     let isSelected: Bool

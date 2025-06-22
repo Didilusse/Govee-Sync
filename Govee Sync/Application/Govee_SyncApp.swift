@@ -23,7 +23,7 @@ struct GoveeSyncApp: App {
             ContentView()
                 .environmentObject(appSettings)
                 .environmentObject(bleManager)
-                .accentColor(appSettings.accentColor)
+                .frame(width: 800, height: 600)
                 
         }
     }
